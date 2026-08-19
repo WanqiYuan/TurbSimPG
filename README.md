@@ -16,7 +16,7 @@ After opening a scene, its main settings can be adjusted from the **Hierarchy** 
 ## Getting started
 
 1. Download or clone this repository.
-2. Download the required `Prefab` folder from Google Drive: [Download Prefabs](GOOGLE_DRIVE_LINK_HERE).
+2. Download the required `Prefab` folder from Google Drive: [Download Prefabs](https://drive.google.com/drive/folders/1DP0ATd4daacZV0a4nkgQjKrcmt1CrqMI?usp=sharing).
 3. Place the downloaded `Prefab` folder directly inside the project's `Assets` directory. The resulting path should be `Assets/Prefab`.
 4. Open the project with Unity `6000.3.9f1`.
 5. In the Unity Project window, open `Assets/Scenes` and select a scene.
