@@ -1,0 +1,894 @@
+﻿#pragma kernel ExternalForces          
+#pragma kernel UpdateSpatialHash       
+#pragma kernel Reorder                 
+#pragma kernel ReorderCopyBack         
+#pragma kernel CalculateDensities      
+#pragma kernel UpdatePositions         
+#pragma kernel UpdateDensityTexture    
+#pragma kernel UpdateTemperature       
+#pragma kernel SISSMUpdatePredictedPositions 
+#pragma kernel ReducePsi               
+#pragma kernel CopyPredictedPositions  
+#pragma kernel ReorderPredictedPositionsStar    
+#pragma kernel ReorderCopyBackPredictedPositionsStar
+#pragma kernel BuildNeighbourList      
+#pragma kernel ClearBucketGrid         
+#pragma kernel BuildBucketGrid         
+
+
+#include "./FluidMaths3D.hlsl"  
+#include "./SpatialHash3D.hlsl"
+
+static const int ThreadGroupSize = 256;
+
+
+struct HeatSourceData
+{
+    float4x4 localToWorld;
+    float4x4 worldToLocal;
+    float temperature;
+    float influence;
+    float3 padding;
+};
+
+#define REDUCE_TGS 256
+groupshared float sdata[REDUCE_TGS];
+RWStructuredBuffer<float> PsiPartialSums;
+const uint reduceCount;
+
+//Buffers
+RWStructuredBuffer<float3> Positions;
+RWStructuredBuffer<float3> PredictedPositions;
+RWStructuredBuffer<float3> PredictedPositionsStar; //Temporarily store x*
+RWStructuredBuffer<float3> PredictedPositionsNext; // Predicted positions for next iteration
+RWStructuredBuffer<float3> Velocities;
+RWStructuredBuffer<float2> Densities;
+RWStructuredBuffer<float> PsiPerParticle;
+
+RWStructuredBuffer<uint> SpatialKeys;
+RWStructuredBuffer<uint> SpatialOffsets;
+RWStructuredBuffer<uint> SortedIndices;
+
+RWStructuredBuffer<float3> Debug;
+
+StructuredBuffer<HeatSourceData> HeatSources;
+int heatSourceCount;
+
+RWStructuredBuffer<float> Temperature;
+
+// Bucket Grid for Temperature Update, based on positions
+#define BUCKET_MAX_PER_CELL 64
+RWStructuredBuffer<uint> BucketCellCounts;
+RWStructuredBuffer<uint> BucketCellEntries;
+uint3 bucketGridRes;
+float3 bucketGridOrigin;
+float bucketGridCellSize;
+
+uint GetBucketIndex(uint3 cell)
+{
+    if (any(cell >= bucketGridRes))
+        return 0xFFFFFFFF;
+    return cell.x + cell.y * bucketGridRes.x + cell.z * bucketGridRes.x * bucketGridRes.y;
+}
+
+//Constants
+const uint numParticles;
+const float gravity;
+const float deltaTime;
+const float simTime;
+const float collisionDamping;
+const float smoothingRadius;
+const float targetDensity;
+const float edgeForce;
+const float edgeForceDst;
+const float3 boundsSize;
+const float sissmMu;
+const float3 centre;
+const int simulationRegionShape;
+
+#define SIMULATION_REGION_BOX 0
+#define SIMULATION_REGION_SQUARE_PYRAMID 1
+
+
+const float4x4 localToWorld;
+const float4x4 worldToLocal;
+
+
+const float2 interactionInputPoint;
+const float interactionInputStrength;
+const float interactionInputRadius;
+
+
+float4x4 heatSourceLocalToWorld;
+float4x4 heatSourceWorldToLocal;
+float heatTransferRate;
+float heatSourceTemperature;
+float baseTemperature;
+float maximumTemperature;
+float temperatureDiffusion;
+float thermalExpansion;
+
+float tempGradientForce;
+
+
+
+RWTexture3D<float> DensityMap;
+RWTexture3D<float> TemperatureMap;
+const uint3 densityMapSize;
+
+
+RWStructuredBuffer<int> NeighborList;
+RWStructuredBuffer<int> NeighborCount;
+int Kmax;
+#define MAX_K 64
+
+
+float Remap01(float val, float minVal, float maxVal)
+{
+    return saturate((val - minVal) / (maxVal - minVal));
+}
+
+bool IsInsideSquarePyramidLocal(float3 posLocal)
+{
+    if (posLocal.y < -0.5 || posLocal.y > 0.5)
+        return false;
+
+    float halfExtent = 0.5 * (0.5 - posLocal.y);
+    return abs(posLocal.x) <= halfExtent && abs(posLocal.z) <= halfExtent;
+}
+
+bool IsInsideSimulationRegionLocal(float3 posLocal)
+{
+    if (simulationRegionShape == SIMULATION_REGION_SQUARE_PYRAMID)
+        return IsInsideSquarePyramidLocal(posLocal);
+
+    return all(abs(posLocal) <= 0.5);
+}
+
+void ResolvePlaneCollision(
+    inout float3 posLocal,
+    inout float3 velocityLocal,
+    float3 outwardNormal,
+    float planeOffset,
+    float damping)
+{
+    float outsideDistance = dot(outwardNormal, posLocal) - planeOffset;
+    if (outsideDistance <= 0)
+        return;
+
+    posLocal -= outwardNormal * outsideDistance;
+
+    float outwardVelocity = dot(velocityLocal, outwardNormal);
+    if (outwardVelocity > 0)
+    {
+        velocityLocal -= (1.0 + damping) * outwardVelocity * outwardNormal;
+    }
+}
+
+void ResolveSquarePyramidCollisions(inout float3 posLocal, inout float3 velocityLocal, float damping)
+{
+    const float sideNormalLength = 1.11803398875;
+    const float3 positiveXNormal = float3(1.0, 0.5, 0.0) / sideNormalLength;
+    const float3 negativeXNormal = float3(-1.0, 0.5, 0.0) / sideNormalLength;
+    const float3 positiveZNormal = float3(0.0, 0.5, 1.0) / sideNormalLength;
+    const float3 negativeZNormal = float3(0.0, 0.5, -1.0) / sideNormalLength;
+    const float sidePlaneOffset = 0.25 / sideNormalLength;
+
+    // Repeating the convex-plane projection handles particles that cross an edge
+    // or corner and therefore violate more than one pyramid plane at once.
+    [unroll]
+    for (int iteration = 0; iteration < 3; iteration++)
+    {
+        ResolvePlaneCollision(posLocal, velocityLocal, float3(0, -1, 0), 0.5, damping);
+        ResolvePlaneCollision(posLocal, velocityLocal, float3(0, 1, 0), 0.5, damping);
+        ResolvePlaneCollision(posLocal, velocityLocal, positiveXNormal, sidePlaneOffset, damping);
+        ResolvePlaneCollision(posLocal, velocityLocal, negativeXNormal, sidePlaneOffset, damping);
+        ResolvePlaneCollision(posLocal, velocityLocal, positiveZNormal, sidePlaneOffset, damping);
+        ResolvePlaneCollision(posLocal, velocityLocal, negativeZNormal, sidePlaneOffset, damping);
+    }
+}
+
+// Collision with the selected simulation boundary.
+void ResolveCollisions(inout float3 pos, inout float3 vel, float collisionDamping)
+{
+    
+    float3 posLocal = mul(worldToLocal, float4(pos, 1)).xyz;
+    float3 velocityLocal = mul(worldToLocal, float4(vel, 0)).xyz;
+
+    
+    if (simulationRegionShape == SIMULATION_REGION_SQUARE_PYRAMID)
+    {
+        ResolveSquarePyramidCollisions(posLocal, velocityLocal, collisionDamping);
+    }
+    else
+    {
+        const float3 halfSize = 0.5;
+        const float3 edgeDst = halfSize - abs(posLocal);
+
+        if (edgeDst.x <= 0)
+        {
+            posLocal.x = halfSize.x * sign(posLocal.x);
+            velocityLocal.x *= -1 * collisionDamping;
+        }
+        if (edgeDst.y <= 0)
+        {
+            posLocal.y = halfSize.y * sign(posLocal.y);
+            velocityLocal.y *= -1 * collisionDamping;
+        }
+        if (edgeDst.z <= 0)
+        {
+            posLocal.z = halfSize.z * sign(posLocal.z);
+            velocityLocal.z *= -1 * collisionDamping;
+        }
+    }
+
+   
+    pos = mul(localToWorld, float4(posLocal, 1)).xyz;
+    vel = mul(localToWorld, float4(velocityLocal, 0)).xyz;
+}
+
+
+// PCG random number generator
+// Thanks：www.pcg-random.org and www.shadertoy.com/view/XlGcRh
+uint NextRandom(inout uint state)
+{
+    state = state * 747796405 + 2891336453;
+    uint result = ((state >> ((state >> 28) + 4)) ^ state) * 277803737;
+    result = (result >> 22) ^ result;
+    return result;
+}
+
+// Random float in [0,1]
+float RandomValue(inout uint state)
+{
+    return NextRandom(state) / 4294967295.0; // 2^32 - 1
+}
+
+
+[numthreads(ThreadGroupSize, 1, 1)]
+void BuildNeighbourList(uint3 tid : SV_DispatchThreadID)
+{
+    uint iSorted = tid.x;
+    if (iSorted >= (uint) numParticles)
+        return;
+
+    float3 pos = PredictedPositions[iSorted];
+    int3 originCell = GetCell3D(pos, smoothingRadius);
+
+    float d2buf[MAX_K];
+    int ibuf[MAX_K];
+    int found = 0;
+    [unroll]
+    for (int t = 0; t < MAX_K; ++t)
+    {
+        d2buf[t] = 1e30;
+        ibuf[t] = -1;
+    }
+
+    float R2 = smoothingRadius * smoothingRadius;
+
+    [unroll]
+    for (int oi = 0; oi < 27; ++oi)
+    {
+        uint hash = HashCell3D(originCell + offsets3D[oi]);
+        uint key = KeyFromHash(hash, (uint) numParticles);
+        uint curr = SpatialOffsets[key];
+
+        while (curr < (uint) numParticles)
+        {
+            uint idx = curr++;
+            if (SpatialKeys[idx] != key)
+                break;
+            if (idx == iSorted)
+                continue;
+
+            float3 d = PredictedPositions[idx] - pos;
+            float d2 = dot(d, d);
+            if (d2 > R2)
+                continue;
+
+            int lim = (found < Kmax) ? found : (Kmax - 1);
+            if (d2 < d2buf[lim])
+            {
+                int ins = lim;
+                while (ins > 0 && d2 < d2buf[ins - 1])
+                {
+                    d2buf[ins] = d2buf[ins - 1];
+                    ibuf[ins] = ibuf[ins - 1];
+                    --ins;
+                }
+                d2buf[ins] = d2;
+                ibuf[ins] = (int) idx;
+                if (found < Kmax)
+                    ++found;
+            }
+        }
+    }
+
+    int baseOut = (int) iSorted * Kmax;
+    [unroll]
+    for (int n = 0; n < Kmax; ++n)
+    {
+        NeighborList[baseOut + n] = (n < found) ? ibuf[n] : -1;
+    }
+    NeighborCount[iSorted] = found;
+}
+
+
+[numthreads(ThreadGroupSize, 1, 1)]
+void ExternalForces(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numParticles)
+        return;
+
+    float temp = Temperature[id.x];
+    float3 pos = Positions[id.x];
+    float3 vel = Velocities[id.x];
+
+    //Gravity set as 0 for air turbulence
+    vel += float3(0, gravity, 0) * deltaTime;
+
+    float buoyancyForce = thermalExpansion * (temp - baseTemperature);
+    vel += float3(0, buoyancyForce, 0) * deltaTime;
+
+    // velocity clamping to prevent excessive speeds
+    float maxSpeed = 10.0f;
+    float speed = length(vel);
+    if (speed > maxSpeed)
+    {
+        vel = vel * (maxSpeed / speed);
+    }
+    
+    Velocities[id.x] = vel;
+    PredictedPositions[id.x] = pos + vel * deltaTime;
+    PredictedPositionsStar[id.x] = PredictedPositions[id.x];
+}
+
+// Heat source to particles
+float CalculateHeatSourceTransfer(float3 worldPos, float currentTemp)
+{
+    float totalHeatTransfer = 0;
+    
+    [loop]
+    for (int i = 0; i < heatSourceCount; i++)
+    {
+        float3 localPos = mul(HeatSources[i].worldToLocal, float4(worldPos, 1.0)).xyz;
+        float3 absPos = abs(localPos);
+        
+        // if inside the heat source influence area
+        if (all(absPos <= 0.5))
+        {
+            float tempDiff = (HeatSources[i].temperature - currentTemp);
+            totalHeatTransfer += tempDiff * HeatSources[i].influence * heatTransferRate * deltaTime;
+            continue;
+        }
+        
+        float3 surfaceOffset = max(absPos - 0.5, 0.0);
+        float distance = length(surfaceOffset);
+        
+        float maxDistance = smoothingRadius;
+        //if particle is very close to the heat source, directly apply heat source temperature
+        if (distance < maxDistance)
+        {
+            return HeatSources[i].temperature - currentTemp;
+        }
+    }
+    
+    return 0.0;
+}
+
+
+bool IsNearBoundary(float3 pos)
+{
+    float3 localPos = mul(worldToLocal, float4(pos, 1)).xyz;
+
+    if (simulationRegionShape == SIMULATION_REGION_SQUARE_PYRAMID)
+    {
+        const float nearDistance = 0.02;
+        const float sideNormalLength = 1.11803398875;
+        const float sidePlaneOffset = 0.25 / sideNormalLength;
+        float distanceToBoundary = min(localPos.y + 0.5, 0.5 - localPos.y);
+        distanceToBoundary = min(distanceToBoundary,
+            sidePlaneOffset - dot(float3(1.0, 0.5, 0.0) / sideNormalLength, localPos));
+        distanceToBoundary = min(distanceToBoundary,
+            sidePlaneOffset - dot(float3(-1.0, 0.5, 0.0) / sideNormalLength, localPos));
+        distanceToBoundary = min(distanceToBoundary,
+            sidePlaneOffset - dot(float3(0.0, 0.5, 1.0) / sideNormalLength, localPos));
+        distanceToBoundary = min(distanceToBoundary,
+            sidePlaneOffset - dot(float3(0.0, 0.5, -1.0) / sideNormalLength, localPos));
+        return distanceToBoundary < nearDistance;
+    }
+
+    const float boundaryThreshold = 0.48;
+    return any(abs(localPos) > boundaryThreshold);
+}
+
+
+[numthreads(ThreadGroupSize, 1, 1)]
+void UpdateTemperature(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numParticles)
+        return;
+
+    float3 pos = Positions[id.x];
+    float3 velocity = Velocities[id.x];
+    float currentTemp = Temperature[id.x];
+    
+    //If partilce is near boundary, reset to base temperature
+    if (IsNearBoundary(pos))
+    {
+        Temperature[id.x] = baseTemperature;
+        return;
+    }
+    
+    float heatSourceChange = CalculateHeatSourceTransfer(pos, currentTemp);
+    
+    float3 tempGradient = 0;
+    float tempLaplacian = 0;
+    float totalWeight = 0;
+    
+    float3 lp = pos - bucketGridOrigin;
+    int3 centerCell = (int3) (lp / bucketGridCellSize);
+
+    for (int dz = -1; dz <= 1; dz++)
+        for (int dy = -1; dy <= 1; dy++)
+            for (int dx = -1; dx <= 1; dx++)
+            {
+                int3 nc = centerCell + int3(dx, dy, dz);
+                if (any(nc < 0) || any(nc >= (int3) bucketGridRes))
+                    continue;
+
+                uint ci = GetBucketIndex((uint3) nc);
+                uint count = min(BucketCellCounts[ci], (uint) BUCKET_MAX_PER_CELL);
+
+                for (uint i = 0; i < count; i++)
+                {
+                    uint neighborIndex = BucketCellEntries[ci * BUCKET_MAX_PER_CELL + i];
+                    if (neighborIndex == id.x)
+                        continue;
+
+                    float3 neighborPos = Positions[neighborIndex];
+                    float3 offset = neighborPos - pos;
+                    float sqrDst = dot(offset, offset);
+                    if (sqrDst > 0 && sqrDst < smoothingRadius * smoothingRadius)
+                    {
+                        float dst = sqrt(sqrDst);
+                        float3 dir = offset / dst;
+                        float neighborTemp = Temperature[neighborIndex];
+                        float tempDiff = neighborTemp - currentTemp;
+                        float weight = SmoothingKernelPoly6(dst, smoothingRadius);
+                        tempGradient += dir * tempDiff * weight;
+                        tempLaplacian += tempDiff * weight;
+                        totalWeight += weight;
+                    }
+                }
+            }
+    
+    if (totalWeight > 0)
+    {
+        tempGradient /= totalWeight;
+        tempLaplacian /= totalWeight;
+        
+        // Temperature diffusion term
+        float diffusion = temperatureDiffusion * tempLaplacian * deltaTime;
+        
+        // Convection
+        float gradientMagnitude = length(tempGradient);
+        float3 turbulenceVelocity = tempGradient * tempGradientForce * gradientMagnitude;
+        
+        Velocities[id.x] += turbulenceVelocity * deltaTime;
+        currentTemp += diffusion + heatSourceChange;
+    }
+    
+    // Clamp the temeoerature between base and max heat source temperature
+    float maxTemp = max(baseTemperature, maximumTemperature);
+    Temperature[id.x] = clamp(currentTemp, baseTemperature, maxTemp);
+}
+
+[numthreads(ThreadGroupSize, 1, 1)]
+void UpdateSpatialHash(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numParticles)
+        return;
+
+    uint index = id.x;
+    int3 cell = GetCell3D(PredictedPositions[index], smoothingRadius);
+    uint hash = HashCell3D(cell);
+    uint key = KeyFromHash(hash, numParticles);
+
+    SpatialKeys[id.x] = key;
+    SortedIndices[id.x] = id.x;
+    SpatialOffsets[id.x] = numParticles;
+}
+
+RWStructuredBuffer<float3> SortTarget_Positions;
+RWStructuredBuffer<float3> SortTarget_PredictedPositions;
+RWStructuredBuffer<float3> SortTarget_Velocities;
+RWStructuredBuffer<float3> SortTarget_PredictedPositionsStar;
+RWStructuredBuffer<float> SortTarget_Temperature;
+
+[numthreads(ThreadGroupSize, 1, 1)]
+void Reorder(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numParticles)
+        return;
+    uint sortedIndex = SortedIndices[id.x];
+    SortTarget_Positions[id.x] = Positions[sortedIndex];
+    SortTarget_PredictedPositions[id.x] = PredictedPositions[sortedIndex];
+    SortTarget_Velocities[id.x] = Velocities[sortedIndex];
+
+}
+
+[numthreads(ThreadGroupSize, 1, 1)]
+void ReorderCopyBack(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numParticles)
+        return;
+
+    Positions[id.x] = SortTarget_Positions[id.x];
+    PredictedPositions[id.x] = SortTarget_PredictedPositions[id.x];
+    Velocities[id.x] = SortTarget_Velocities[id.x];
+    
+}
+
+[numthreads(ThreadGroupSize, 1, 1)]
+void ReorderPredictedPositionsStar(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numParticles)
+        return;
+    uint sortedIndex = SortedIndices[id.x];
+    SortTarget_Temperature[id.x] = Temperature[sortedIndex];
+    SortTarget_PredictedPositionsStar[id.x] = PredictedPositionsStar[sortedIndex];
+    
+}
+
+[numthreads(ThreadGroupSize, 1, 1)]
+void ReorderCopyBackPredictedPositionsStar(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numParticles)
+        return;
+    Temperature[id.x] = SortTarget_Temperature[id.x];
+    PredictedPositionsStar[id.x] = SortTarget_PredictedPositionsStar[id.x];
+}
+
+inline float2 CalculateDensitiesWithList(uint particleIndex)
+{
+    float3 pos = PredictedPositions[particleIndex];
+    float density = 0.0;
+    float nearDensity = 0.0;
+
+    int neighborCount = NeighborCount[particleIndex];
+    int baseIdx = (int) particleIndex * Kmax;
+
+    for (int n = 0; n < neighborCount; n++)
+    {
+        int neighborIndex = NeighborList[baseIdx + n];
+        if (neighborIndex < 0 || neighborIndex >= numParticles)
+            continue;
+            
+        float3 neighborPos = PredictedPositions[neighborIndex];
+        float3 offsetToNeighbour = neighborPos - pos;
+        float sqrDst = dot(offsetToNeighbour, offsetToNeighbour);
+        
+        if (sqrDst > 0)
+        {
+            float dst = sqrt(sqrDst);
+            
+            density += SpikyKernel3D(dst, smoothingRadius);
+            
+            nearDensity += NearDensityKernel(dst, smoothingRadius);
+        }
+    }
+    density = max(density, targetDensity);
+
+    return float2(density, nearDensity);
+}
+
+inline float2 CalculateDensitiesAtPoint(float3 pos)
+{
+    int3 originCell = GetCell3D(pos, smoothingRadius);
+    float sqrRadius = smoothingRadius * smoothingRadius;
+    float density = 0.0;
+    float nearDensity = 0.0;
+    
+    [unroll]
+    for (int i = 0; i < 27; i++)
+    {
+        uint hash = HashCell3D(originCell + offsets3D[i]);
+        uint key = KeyFromHash(hash, numParticles);
+        uint currIndex = SpatialOffsets[key];
+
+        while (currIndex < numParticles)
+        {
+            uint neighbourIndex = currIndex++;
+            uint neighbourKey = SpatialKeys[neighbourIndex];
+            if (neighbourKey != key)
+                break;
+
+            float3 neighbourPos = PredictedPositions[neighbourIndex];
+            float3 offsetToNeighbour = neighbourPos - pos;
+            float sqrDst = dot(offsetToNeighbour, offsetToNeighbour);
+            if (sqrDst > sqrRadius)
+                continue;
+
+            float dst = sqrt(sqrDst);
+            
+            density += SpikyKernel3D(dst, smoothingRadius);
+            
+            nearDensity += NearDensityKernel(dst, smoothingRadius);
+        }
+    }
+    density = max(density, targetDensity);
+
+    return float2(density, nearDensity);
+}
+
+[numthreads(ThreadGroupSize, 1, 1)]
+void CalculateDensities(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numParticles)
+        return;
+
+    float2 densities = CalculateDensitiesWithList(id.x);
+
+    Densities[id.x] = densities;
+}
+
+[numthreads(ThreadGroupSize, 1, 1)]
+void CopyPredictedPositions(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numParticles)
+        return;
+        
+    PredictedPositions[id.x] = PredictedPositionsNext[id.x];
+}
+
+float superfast(uint3 data)
+{
+    uint hash = 8u, tmp;
+
+    hash += data.x & 0xffffu;
+    tmp = (((data.x >> 16) & 0xffffu) << 11) ^ hash;
+    hash = (hash << 16) ^ tmp;
+    hash += hash >> 11;
+
+    hash += data.y & 0xffffu;
+    tmp = (((data.y >> 16) & 0xffffu) << 11) ^ hash;
+    hash = (hash << 16) ^ tmp;
+    hash += hash >> 11;
+
+    hash += data.z & 0xffffu;
+    tmp = (((data.z >> 16) & 0xffffu) << 11) ^ hash;
+    hash = (hash << 16) ^ tmp;
+    hash += hash >> 11;
+
+    
+    hash ^= hash << 3;
+    hash += hash >> 5;
+    hash ^= hash << 4;
+    hash += hash >> 17;
+    hash ^= hash << 25;
+    hash += hash >> 6;
+
+    return hash / 4294967295.0;
+}
+
+
+// Thanks https://math.stackexchange.com/a/4112622
+// Calculate an arbitrary orthonormal vector to the given direction
+float3 CalculateOrthonormal(float3 dir)
+{
+    float a = sign((sign(dir.x) + 0.5) * (sign(dir.z) + 0.5));
+    float b = sign((sign(dir.y) + 0.5) * (sign(dir.z) + 0.5));
+    float3 orthoVec = float3(a * dir.z, b * dir.z, -a * dir.x - b * dir.y);
+    return normalize(orthoVec);
+}
+
+[numthreads(8, 8, 8)]
+void UpdateDensityTexture(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= densityMapSize.x || id.y >= densityMapSize.y || id.z >= densityMapSize.z)
+        return;
+    
+    float3 texturePos = id / (densityMapSize - 1.0);
+    float3 worldPos = (texturePos - 0.5) * boundsSize + centre;
+
+    float3 localPos = mul(worldToLocal, float4(worldPos, 1.0)).xyz;
+    if (!IsInsideSimulationRegionLocal(localPos))
+    {
+        DensityMap[id] = 0.0;
+        TemperatureMap[id] = baseTemperature;
+        return;
+    }
+
+    float2 densityValues = CalculateDensitiesAtPoint(worldPos);
+    DensityMap[id] = densityValues[0];
+
+    int3 originCell = GetCell3D(worldPos, smoothingRadius);
+    float sqrRadius = smoothingRadius * smoothingRadius;
+    float weightedTemperature = 0.0;
+    float totalWeight = 0.0;
+    [unroll]
+    for (int i = 0; i < 27; i++)
+    {
+        uint hash = HashCell3D(originCell + offsets3D[i]);
+        uint key = KeyFromHash(hash, numParticles);
+        uint currIndex = SpatialOffsets[key];
+        while (currIndex < numParticles)
+        {
+            uint neighbourIndex = currIndex++;
+            if (SpatialKeys[neighbourIndex] != key)
+                break;
+            float3 neighbourPos = PredictedPositions[neighbourIndex];
+            float3 offset = neighbourPos - worldPos;
+            float sqrDst = dot(offset, offset);
+            if (sqrDst > sqrRadius)
+                continue;
+            float weight = SmoothingKernelPoly6(sqrt(sqrDst), smoothingRadius);
+            weightedTemperature += Temperature[neighbourIndex] * weight;
+            totalWeight += weight;
+        }
+    }
+    TemperatureMap[id] = totalWeight > 0.0 ? weightedTemperature / totalWeight : baseTemperature;
+}
+
+
+
+[numthreads(ThreadGroupSize, 1, 1)]
+void SISSMUpdatePredictedPositions(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numParticles)
+        return;
+        
+    float3 xi_star = PredictedPositionsStar[id.x];
+    float3 xi_k = PredictedPositions[id.x];
+    
+    float rho_i = Densities[id.x][0];
+    float lambda_i = rho_i / max(targetDensity, 1e-6);
+    
+    const float A_factor = sissmMu * deltaTime * deltaTime / max(targetDensity, 1e-6);
+    
+    float3 sum_sym_A_minus_dx = 0.0.xxx;
+    float3 sum_sym_A_plus_xj = 0.0.xxx;
+    float sum_sym_A_plus = 0.0;
+    
+    float3 grad_bulk = 0.0.xxx;
+    
+    const float EPS = 1e-12;
+    float sqrRadius = smoothingRadius * smoothingRadius;
+    
+    int neighborCount = NeighborCount[id.x];
+    int baseIdx = (int) id.x * Kmax;
+    
+    for (int n = 0; n < neighborCount; n++)
+    {
+        int j = NeighborList[baseIdx + n];
+        if (j < 0 || j >= numParticles)
+            continue;
+            
+        float3 xj_k = PredictedPositions[j];
+        float3 rij = xj_k - xi_k;
+        float r2 = dot(rij, rij);
+        
+        if (r2 <= EPS || r2 > sqrRadius)
+            continue;
+            
+        float r = sqrt(r2);
+        float inv_r = 1.0 / r;
+        
+        float dw_div_r = dWdr(r, smoothingRadius) * inv_r;
+        
+        float rho_j = Densities[j][0];
+        float lambda_j = rho_j / max(targetDensity, 1e-6);
+        
+        float A_ij_plus = A_factor * (-1.0) * dw_div_r;
+        float A_ij_minus = A_factor * lambda_i * dw_div_r;
+        
+        float A_ji_plus = A_factor * (-1.0) * dw_div_r;
+        float A_ji_minus = A_factor * lambda_j * dw_div_r;
+        
+        float sym_A_plus = A_ij_plus + A_ji_plus;
+        float sym_A_minus = A_ij_minus + A_ji_minus;
+        
+        sum_sym_A_plus += sym_A_plus;
+        sum_sym_A_plus_xj += sym_A_plus * xj_k;
+        sum_sym_A_minus_dx += sym_A_minus * (xj_k - xi_k);
+        
+        grad_bulk += dw_div_r * (xi_k - xj_k);
+    }
+    
+    float denom14 = 1.0 + sum_sym_A_plus;
+    denom14 = (denom14 > EPS) ? denom14 : 1.0;
+    float3 xtilde = (xi_star + sum_sym_A_minus_dx + sum_sym_A_plus_xj) / denom14;
+    
+    const float inv_h2 = 1.0 / (deltaTime * deltaTime);
+    
+    float3 dx_pos = xi_k - xi_star;
+    float psi_pos = 0.5 * inv_h2 * dot(dx_pos, dx_pos);
+    float psi_blk = sissmMu * 0.5 * (lambda_i - 1.0) * (lambda_i - 1.0);
+    float psi_i = psi_pos + psi_blk;
+    
+    float3 grad_i = inv_h2 * dx_pos + (sissmMu * (lambda_i - 1.0) / max(targetDensity, 1e-6)) * grad_bulk;
+    
+    float3 s = xtilde - xi_k;
+    float denomA = dot(grad_i, s);
+    float alpha = 0.0;
+    if (denomA < -1e-20) 
+        alpha = saturate(-psi_i / denomA);
+    
+    PredictedPositionsNext[id.x] = xi_k + alpha * s;
+    PsiPerParticle[id.x] = psi_i;
+}
+
+[numthreads(REDUCE_TGS, 1, 1)]
+void ReducePsi(uint3 id : SV_DispatchThreadID,
+               uint3 tid : SV_GroupThreadID,
+               uint3 gid : SV_GroupID)
+{
+    uint baseIdx = gid.x * REDUCE_TGS;
+    uint i = baseIdx + tid.x;
+
+    float v = (i < reduceCount) ? PsiPerParticle[i] : 0.0;
+    sdata[tid.x] = v;
+    GroupMemoryBarrierWithGroupSync();
+    
+    [unroll]
+    for (uint offset = REDUCE_TGS >> 1; offset > 0; offset >>= 1)
+    {
+        if (tid.x < offset)
+            sdata[tid.x] += sdata[tid.x + offset];
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (tid.x == 0)
+        PsiPartialSums[gid.x] = sdata[0];
+}
+
+[numthreads(ThreadGroupSize, 1, 1)]
+void UpdatePositions(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numParticles)
+        return;
+    
+    float3 x_old = Positions[id.x];
+    float3 x_new = PredictedPositions[id.x];
+    
+    float inv_h = 1.0 / max(deltaTime, SISSM_EPS);
+    float3 v_new = (x_new - x_old) * inv_h;
+    
+    ResolveCollisions(x_new, v_new, collisionDamping);
+    
+    Positions[id.x] = x_new;
+    Velocities[id.x] = v_new;
+}
+
+[numthreads(ThreadGroupSize, 1, 1)]
+void ClearBucketGrid(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx < bucketGridRes.x * bucketGridRes.y * bucketGridRes.z)
+    {
+        BucketCellCounts[idx] = 0;
+    }
+}
+
+[numthreads(ThreadGroupSize, 1, 1)]
+void BuildBucketGrid(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numParticles)
+        return;
+
+    float3 pos = Positions[id.x];
+    float3 lp = pos - bucketGridOrigin;
+    int3 cell = (int3) (lp / bucketGridCellSize);
+    if (any(cell < 0) || any(cell >= (int3) bucketGridRes))
+        return;
+
+    uint ci = GetBucketIndex((uint3) cell);
+    uint slot;
+    InterlockedAdd(BucketCellCounts[ci], 1, slot);
+    if (slot < BUCKET_MAX_PER_CELL)
+    {
+        BucketCellEntries[ci * BUCKET_MAX_PER_CELL + slot] = id.x;
+    }
+}
