@@ -145,7 +145,7 @@ MonoBehaviour:
     m_Value: 1.05
   gladstoneDaleK:
     m_OverrideState: 1
-    m_Value: 0.0000002
+    m_Value: 0.000002
   filterHighDensityDerivedIoR:
     m_OverrideState: 1
     m_Value: 0
